@@ -2,7 +2,7 @@ let selected_pins = new Map();
 let observer_running = false;
 let observer;
 let last_pin_received_time = 0;
-let last_pin_received_cut_off_duration_ms = (1_000 * 30); // 30s
+let last_pin_received_cut_off_duration_ms = (1_000 * 60); // INCREASED to 60s for large boards
 let timeout_watcher_interval = null;
 let auto_scroll_interval = null;
 let cancel_downloads = false;
@@ -10,6 +10,15 @@ let stateful_mode = true;
 let MAX_CONCURRENT_DOWNLOADS = 10;
 let downloaded_pins = new Set();
 let failed_pins = new Set();
+
+// Endless Mode Variables
+let endless_mode_active = false;
+let endless_batch_size = 500; // Download every 500 pins (for endless mode only)
+let endless_total_downloaded = 0;
+
+let current_board_url = '';
+let url_change_observer = null;
+let is_on_board_page = false;
 
 let DOM_template = {
     downloader_button: { self: null },
@@ -46,7 +55,10 @@ let message_template = {
     download_progress: 'Downloading pins',
     download_error: 'ERROR: Failed to download all pins...',
     download_success: 'Successfully downloaded pins!',
-    waiting_for_pins: 'Waiting for new pins...'
+    waiting_for_pins: 'Waiting for new pins...',
+    endless_active: 'Endless Mode Active: Scraping & Downloading...',
+    endless_batch_done: 'Batch downloaded. Resuming search...',
+    endless_stop: 'Endless Mode Stopped.'
 };
 
 const progress_logs = ['cc_log', 'cc_warning', 'cc_error', 'cc_success'];
@@ -121,6 +133,7 @@ async function initialize() {
         logger('INFO', `Loaded ${downloaded_pins.size} previously downloaded pins from history.`);
     }
 
+    setup_url_change_detection();
     let downloader_button = html_to_element(`<div id="cc_enable_downloader">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap');
@@ -192,10 +205,13 @@ function initialize_full_ui() {
     logger('INFO', 'Opening the downloader user interface...');
     cancel_downloads = false;
     failed_pins.clear();
+
+    // Check if we're on a board page
+    is_on_board_page = check_if_board_page();
+
     let full_ui_wrapper_elem = html_to_element(`<div id="cc_full_ui_wrapper">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap');
-        /* --- Styles from previous steps... --- */
         div#cc_full_ui_wrapper *, div#cc_full_ui_wrapper *::before, div#cc_full_ui_wrapper *::after { box-sizing: border-box; margin: 0; padding: 0; transition: all 250ms ease-in-out; user-select: none; }
         div#cc_full_ui_wrapper { background-color: var(--cc_bg_main); border: 1px solid var(--cc_border); block-size: auto; bottom: 1.5rem !important; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15); color: var(--cc_fg_main); font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: var(--cc_fz_12px); inline-size: clamp(320px, 90vw, 480px); left: calc(72px + 0.8rem) !important; overflow: hidden; position: fixed !important; z-index: 999999; }
         div#cc_full_ui_wrapper a:hover, div#cc_full_ui_wrapper #cc_select_all_visible_pins_elem:hover { filter: brightness(0.9); }
@@ -226,7 +242,7 @@ function initialize_full_ui() {
         div#cc_full_ui_wrapper footer#cc_section_3 { display: flex; justify-content: space-between; align-items: center; padding: 0.6rem 1.5rem; inline-size: 100%; font-size: var(--cc_fz_9px); line-height: 1; border-block-start: 1px solid var(--cc_border); background-color: #F8F9FA; }
         div#cc_full_ui_wrapper footer#cc_section_3 a { line-height: inherit; font-weight: bold; cursor: pointer; color: var(--cc_fg_sec); }
         div#cc_full_ui_wrapper footer#cc_section_3 a:hover { color: var(--cc_fg_main); }
-        div#cc_full_ui_wrapper #cc_history_controls { display: flex; gap: 1rem; }
+        div#cc_full_ui_wrapper #cc_history_controls { display: flex; gap: 1rem; align-items: center; }
         div#cc_full_ui_wrapper #cc_minimize_btn { color: var(--cc_fg_sec); cursor: pointer; height: 1.5rem; position: absolute; right: 3rem; top: 1rem; width: 1.5rem; }
         div#cc_full_ui_wrapper #cc_minimize_btn:hover { color: var(--cc_fg_main); }
         div#cc_full_ui_wrapper #cc_minimize_btn:active { transform: scale(0.9); }
@@ -236,6 +252,13 @@ function initialize_full_ui() {
         div#cc_full_ui_wrapper.cc_minimized #cc_controls_wrapper { margin-block-start: 0; }
         div#cc_full_ui_wrapper.cc_minimized #cc_minimize_btn { display: none; }
         div#cc_full_ui_wrapper.cc_minimized #cc_close_btn { display: none; }
+        
+        /* Endless Mode Styles */
+        a#cc_endless_btn { color: var(--cc_accent_1) !important; transition: color 0.2s; }
+        a#cc_endless_btn:hover { color: var(--cc_accent_2) !important; }
+        a#cc_endless_btn[data-active="true"] { color: #FFFFFF !important; background-color: var(--cc_error); padding: 4px 8px; border-radius: 4px; }
+        a#cc_endless_btn[data-active="true"]:hover { background-color: #bd2130; }
+
         @media (max-width: 768px) {
             div#cc_full_ui_wrapper { left: 50% !important; transform: translateX(-50%); width: 90vw !important; }
         }
@@ -246,7 +269,7 @@ function initialize_full_ui() {
     </svg>
     <svg id="cc_close_btn" viewBox="0 0 21 21" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7.5 7.5L13.5 13.5M13.5 7.5L7.5 13.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
     <section id="cc_section_1">
-        <header id="branding"><svg id="cc_pinterest_icon" viewBox="0 0 12 R13" fill="none" xmlns="http://www.w3.org/2000/svg"><g clip-path="url(#clip0_214_217)"><rect y="0.5" width="12" height="12" rx="6" fill="#E9E9E9" /><path d="M3.77 12.075C3.70334 11.3917 3.74667 10.7367 3.9 10.11L4.5 7.52C4.38997 7.18576 4.33097 6.83684 4.325 6.485C4.325 5.645 4.73 5.045 5.37 5.045C5.81 5.045 6.135 5.355 6.135 5.945C6.135 6.135 6.09667 6.34833 6.02 6.585L5.76 7.445C5.71 7.61167 5.685 7.765 5.685 7.905C5.685 8.505 6.14 8.84 6.725 8.84C7.77 8.84 8.51 7.76 8.51 6.36C8.51 4.8 7.49 3.8 5.985 3.8C4.305 3.8 3.24 4.895 3.24 6.42C3.24 7.03 3.43 7.6 3.795 7.99C3.675 8.195 3.545 8.23 3.355 8.23C2.755 8.23 2.185 7.385 2.185 6.23C2.185 4.23 3.785 2.645 6.025 2.645C8.375 2.645 9.855 4.29 9.855 6.31C9.855 8.33 8.415 9.885 6.865 9.885C6.57003 9.88889 6.27821 9.82405 6.01265 9.69561C5.74709 9.56717 5.51508 9.37865 5.335 9.145L5.025 10.395C4.86976 11.0511 4.5952 11.6732 4.215 12.23C5.11334 12.5122 6.06554 12.5786 6.99435 12.4239C7.92316 12.2691 8.8024 11.8976 9.56075 11.3394C10.3191 10.7813 10.9352 10.0522 11.359 9.21135C11.7828 8.37051 12.0024 7.44161 12 6.5C12 4.9087 11.3679 3.38258 10.2426 2.25736C9.11742 1.13214 7.5913 0.5 6 0.5C4.4087 0.5 2.88258 1.13214 1.75736 2.25736C0.632143 3.38258 1.92232e-06 4.9087 1.92232e-06 6.5C-0.00095816 7.69967 0.35773 8.87208 1.02975 9.86585C1.70177 10.8596 2.65627 11.6291 3.77 12.075Z" fill="#BD081C" /></g><defs><clipPath id="clip0_214_217"><rect y="0.5" width="12" height="12" rx="6" fill="white" /></clipPath></defs></svg><h1 id="cc_branding_name">Pinterest Board Downloader</h1></header>
+        <header id="branding"><svg id="cc_pinterest_icon" viewBox="0 0 12 13" fill="none" xmlns="http://www.w3.org/2000/svg"><g clip-path="url(#clip0_214_217)"><rect y="0.5" width="12" height="12" rx="6" fill="#E9E9E9" /><path d="M3.77 12.075C3.70334 11.3917 3.74667 10.7367 3.9 10.11L4.5 7.52C4.38997 7.18576 4.33097 6.83684 4.325 6.485C4.325 5.645 4.73 5.045 5.37 5.045C5.81 5.045 6.135 5.355 6.135 5.945C6.135 6.135 6.09667 6.34833 6.02 6.585L5.76 7.445C5.71 7.61167 5.685 7.765 5.685 7.905C5.685 8.505 6.14 8.84 6.725 8.84C7.77 8.84 8.51 7.76 8.51 6.36C8.51 4.8 7.49 3.8 5.985 3.8C4.305 3.8 3.24 4.895 3.24 6.42C3.24 7.03 3.43 7.6 3.795 7.99C3.675 8.195 3.545 8.23 3.355 8.23C2.755 8.23 2.185 7.385 2.185 6.23C2.185 4.23 3.785 2.645 6.025 2.645C8.375 2.645 9.855 4.29 9.855 6.31C9.855 8.33 8.415 9.885 6.865 9.885C6.57003 9.88889 6.27821 9.82405 6.01265 9.69561C5.74709 9.56717 5.51508 9.37865 5.335 9.145L5.025 10.395C4.86976 11.0511 4.5952 11.6732 4.215 12.23C5.11334 12.5122 6.06554 12.5786 6.99435 12.4239C7.92316 12.2691 8.8024 11.8976 9.56075 11.3394C10.3191 10.7813 10.9352 10.0522 11.359 9.21135C11.7828 8.37051 12.0024 7.44161 12 6.5C12 4.9087 11.3679 3.38258 10.2426 2.25736C9.11742 1.13214 7.5913 0.5 6 0.5C4.4087 0.5 2.88258 1.13214 1.75736 2.25736C0.632143 3.38258 1.92232e-06 4.9087 1.92232e-06 6.5C-0.00095816 7.69967 0.35773 8.87208 1.02975 9.86585C1.70177 10.8596 2.65627 11.6291 3.77 12.075Z" fill="#BD081C" /></g><defs><clipPath id="clip0_214_217"><rect y="0.5" width="12" height="12" rx="6" fill="white" /></clipPath></defs></svg><h1 id="cc_branding_name">Pinterest Board Downloader</h1></header>
         <p id="cc_manual"><b>Right Click + Shift</b> to select/deselect pins. Avoid closing the tab or opening pins while downloading. Hope you find this tool helpful!</p>
         <div id="cc_controls_wrapper"><div id="cc_selected_pins_wrapper" class="cc_single_control_wrapper"><h1 id="cc_currently_selected_pins_count_elem" class="cc_count_display">0</h1><p>Selected Pins</p><a id="cc_download_selected_pins_elem" class="cc_download_btn">Download</a></div><div class="cc_v_separator"></div><div id="cc_board_count_wrapper" class="cc_single_control_wrapper"><h1 id="cc_current_board_count_elem" class="cc_count_display">N/A</h1><p>Pins on Board</p><a id="cc_download_all_pins_elem" class="cc_download_btn">Download All</a></div><div class="cc_v_separator"></div><div id="cc_select_all_visible_pins_wrapper" class="cc_single_control_wrapper"><h1 id="cc_select_all_visible_pins_elem">Select Visible</h1></div></div>
     </section>
@@ -255,6 +278,7 @@ function initialize_full_ui() {
     <footer id="cc_section_3">
         <a id="cc_stateful_btn" data-stateful="true" role="button">Remember Pins (Enabled)</a>
         <div id="cc_history_controls">
+            <a id="cc_endless_btn" role="button">Endless Mode</a>
             <a id="cc_import_btn" role="button">Import</a>
             <a id="cc_export_btn" role="button">Export</a>
             <a id="cc_clear_history_btn" role="button">Clear History</a>
@@ -276,10 +300,14 @@ function initialize_full_ui() {
     let pin_count = get_board_pin_count();
     if (pin_count?.pin_count >= 0) {
         update_element_html(DOM.full_ui_wrapper.board_count_wrapper.current_board_count_elem.self, pin_count.formatted_pin_count);
-        logger('INFO', `Detected ${pin_count.pin_count} total pins on this board.`);
+        logger('INFO', `Detected ${pin_count.pin_count} total pins on this board/section.`);
     } else {
         DOM.full_ui_wrapper.board_count_wrapper.current_board_count_elem.self.innerHTML = 'N/A';
-        logger('WARN', 'Could not find the total pin count for this board.');
+        if (!is_on_board_page) {
+            logger('INFO', 'Not on a board page.');
+        } else {
+            logger('WARN', 'Could not find the total pin count for this board/section.');
+        }
     }
 
     DOM.full_ui_wrapper.select_visible_pins_elem.self.addEventListener('click', select_all_visible_pins);
@@ -288,9 +316,9 @@ function initialize_full_ui() {
     DOM.full_ui_wrapper.close_ui_elem.self.addEventListener('click', close_full_ui);
     document.addEventListener('contextmenu', handle_click);
 
-    document.addEventListener('scroll', remark_selected_pins);
-    document.addEventListener('drop', remark_selected_pins);
-    window.addEventListener('resize', remark_selected_pins);
+    document.addEventListener('scroll', mark_visible_pins_only);
+    document.addEventListener('drop', mark_visible_pins_only);
+    window.addEventListener('resize', mark_visible_pins_only);
 
     document.body.style.userSelect = 'none';
     DOM.downloader_button.self.classList.add('cc_hidden');
@@ -300,6 +328,7 @@ function initialize_full_ui() {
     const import_btn = full_ui_wrapper_elem.querySelector('#cc_import_btn');
     const export_btn = full_ui_wrapper_elem.querySelector('#cc_export_btn');
     const clear_history_btn = full_ui_wrapper_elem.querySelector('#cc_clear_history_btn');
+    const endless_btn = full_ui_wrapper_elem.querySelector('#cc_endless_btn');
     const minimize_btn = full_ui_wrapper_elem.querySelector('#cc_minimize_btn');
     const section1 = full_ui_wrapper_elem.querySelector('#cc_section_1');
 
@@ -333,9 +362,187 @@ function initialize_full_ui() {
     import_btn.addEventListener('click', import_history);
     export_btn.addEventListener('click', export_history);
     clear_history_btn.addEventListener('click', clear_history);
+    endless_btn.addEventListener('click', toggle_endless_mode);
 
     return;
 }
+
+// --- ENDLESS MODE LOGIC ---
+function toggle_endless_mode() {
+    const endless_btn = document.querySelector('#cc_endless_btn');
+    if (!endless_btn) return;
+
+    if (endless_mode_active) {
+        // STOP Endless Mode
+        stop_endless_mode();
+    } else {
+        // START Endless Mode
+        start_endless_mode();
+    }
+}
+
+function start_endless_mode() {
+    if (endless_mode_active) return;
+
+    // Stop other potential operations
+    cancel_downloads = false;
+    if (observer_running) {
+        observer?.disconnect();
+        clearInterval(timeout_watcher_interval);
+        clearInterval(auto_scroll_interval);
+        observer_running = false;
+    }
+
+    endless_mode_active = true;
+    endless_total_downloaded = 0;
+
+    // UI Updates
+    const endless_btn = document.querySelector('#cc_endless_btn');
+    endless_btn.innerHTML = "STOP (Endless)";
+    endless_btn.dataset.active = "true";
+    DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
+    update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.endless_active);
+    logger('INFO', 'Starting Endless Mode. Will download every 50 pins.');
+
+    // Clear current selection to start fresh
+    selected_pins.clear();
+    update_currently_selected_pins();
+
+    run_endless_loop();
+}
+
+function stop_endless_mode() {
+    if (!endless_mode_active) return;
+
+    endless_mode_active = false;
+    cancel_downloads = true;
+
+    // Stop internals
+    clearInterval(auto_scroll_interval);
+    observer?.disconnect();
+    observer = null;
+    observer_running = false;
+
+    // UI Updates
+    const endless_btn = document.querySelector('#cc_endless_btn');
+    endless_btn.innerHTML = "Endless Mode";
+    endless_btn.dataset.active = "false";
+
+    DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_warning';
+    update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.endless_stop + ` Total session: ${endless_total_downloaded}`);
+    logger('INFO', `Endless Mode stopped. Total pins downloaded this session: ${endless_total_downloaded}`);
+}
+
+async function run_endless_loop() {
+    let target_elem = document.querySelector('[data-test-id="board-feed"]') ||
+        document.querySelector('[data-test-id="board-section-feed"]') ||
+        document.querySelector('[data-test-id="grid"]') ||
+        document.querySelector('[role="main"]') ||
+        document.body;
+
+    let observer_options = { childList: true, subtree: true };
+    observer_running = true;
+
+    // Initial grab
+    select_all_visible_pins();
+
+    observer = new MutationObserver(async (mutation_records) => {
+        if (!endless_mode_active) return;
+
+        let found_new = false;
+        for (let record of mutation_records) {
+            if (record.type !== 'childList') continue;
+            for (let node of record.addedNodes) {
+                if (node.nodeType !== Node.ELEMENT_NODE) continue;
+                let matches = Array.from(node.querySelectorAll('a[href*="/pin/"]')).map(link => link?.href).filter(Boolean);
+                if (matches.length > 0) {
+                    clean_pin_urls(matches).forEach(url => {
+                        if (!downloaded_pins.has(url) && !selected_pins.has(url)) {
+                            // Minimal selection logic for speed
+                            selected_pins.set(url, { url, image_url: '', video_url: '', has_video: false });
+                            found_new = true;
+                        }
+                    });
+                }
+            }
+        }
+
+        if (found_new) update_currently_selected_pins();
+
+        // CHECK BATCH SIZE
+        if (selected_pins.size >= endless_batch_size) {
+            // PAUSE SCROLLING & OBSERVING
+            observer.disconnect();
+            clearInterval(auto_scroll_interval);
+
+            logger('INFO', `Endless Mode: Batch of ${selected_pins.size} reached. Downloading...`);
+            DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
+            update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, `Endless Mode: Downloading batch...`);
+
+            // Populate metadata for the batch (URLs, etc)
+            await populate_metadata_for_endless_batch();
+
+            // DOWNLOAD BATCH
+            const batch_items = [];
+            for (const pin of selected_pins.values()) {
+                if (pin.video_url) batch_items.push({ media_url: pin.video_url, pin_url: pin.url });
+                else if (pin.image_url) batch_items.push({ media_url: pin.image_url, pin_url: pin.url });
+            }
+
+            if (batch_items.length > 0) {
+                try {
+                    const stats = await download_pins(batch_items);
+                    endless_total_downloaded += stats.successful_downloads;
+                    localStorage.setItem('downloaded_pins', JSON.stringify([...downloaded_pins]));
+                } catch (e) {
+                    logger('ERROR', 'Endless batch download error', e);
+                }
+            }
+
+            // CLEANUP & RESUME
+            selected_pins.clear();
+            update_currently_selected_pins();
+
+            if (endless_mode_active) {
+                logger('INFO', 'Endless Mode: Batch finished. Resuming...');
+                DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
+                update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.endless_batch_done);
+
+                observer.observe(target_elem, observer_options);
+                start_auto_scrolling();
+            }
+        }
+    });
+
+    observer.observe(target_elem, observer_options);
+    start_auto_scrolling();
+}
+
+async function populate_metadata_for_endless_batch() {
+    // Fill in image_url and check for video
+    for (let [url, pin] of selected_pins) {
+        const pin_element = get_pin_element_by_url(url);
+        if (pin_element) {
+            let img = pin_element.querySelector('img');
+            let img_srcset = img?.srcset || img?.src || '';
+            pin.image_url = img_srcset ? parse_srcset(img_srcset, true) : '';
+            pin.has_video = !!pin_element.querySelector('video');
+        }
+    }
+
+    // Handle videos if any
+    const pins_with_video = Array.from(selected_pins.values()).filter(p => p.has_video && !p.video_url);
+    if (pins_with_video.length > 0) {
+        DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
+        update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, `Endless Mode: Processing ${pins_with_video.length} videos...`);
+        const video_promises = pins_with_video.map(async (pin) => {
+            const video_url = await get_video_url_from_pin_page(pin.url);
+            if (video_url) pin.video_url = video_url;
+        });
+        await Promise.all(video_promises);
+    }
+}
+// --- END ENDLESS MODE LOGIC ---
 
 function export_history() {
     if (downloaded_pins.size === 0) {
@@ -410,9 +617,33 @@ function clear_history() {
 }
 
 async function remark_selected_pins() {
-    logger('DEBUG', `Screen changed. Re-highlighting selected pins.`);
+    logger('DEBUG', `Screen changed. Re-highlighting selected pins that are visible.`);
+    mark_visible_pins_only();
+}
+
+// New function to only mark pins that exist on the current page
+function mark_visible_pins_only() {
     let pin_urls = Array.from(selected_pins?.keys() || []);
-    select_pins(pin_urls, true, true);
+    let visible_count = 0;
+
+    for (let url of pin_urls) {
+        const pin_element = get_pin_element_by_url(url);
+        if (!pin_element) continue; // Skip pins not on current page
+
+        visible_count++;
+        const overlay_host = pin_element.querySelector('a[href*="/pin/"]') || pin_element.querySelector('[data-test-id="visual-content-container"]');
+        if (!overlay_host) continue;
+
+        let status = 'selected';
+        if (downloaded_pins.has(url)) status = 'downloaded';
+        else if (failed_pins.has(url)) status = 'failed';
+
+        inject_selected_overlay(overlay_host, status, true);
+    }
+
+    if (visible_count > 0) {
+        logger('DEBUG', `Marked ${visible_count} of ${pin_urls.length} selected pins that are visible on current page.`);
+    }
 }
 
 async function handle_click(event) {
@@ -448,7 +679,16 @@ async function handle_click(event) {
 }
 
 async function extract_board_pins(pin_count) {
-    logger('INFO', `Starting automatic search for all ${pin_count} pins on the board...`);
+    // Check if we're on a board page
+    if (!check_if_board_page()) {
+        logger('WARN', 'Cannot extract board pins - not on a board page.');
+        return;
+    }
+
+    // Stop Endless Mode if active
+    if (endless_mode_active) stop_endless_mode();
+
+    logger('INFO', `Starting automatic search for all ${pin_count} pins on the board/section...`);
     if (!Number.isInteger(pin_count) || pin_count <= 0) {
         logger('ERROR', `Cannot start search: Invalid pin count provided.`, { pin_count });
         update_element_html(DOM.full_ui_wrapper.board_count_wrapper.current_board_count_elem.self, 'N/A');
@@ -499,7 +739,11 @@ async function extract_board_pins(pin_count) {
         }
     });
 
-    let target_elem = document.querySelector('[data-test-id="board-feed"]') || document.body;
+    // UPDATED: Target element selection now supports board sections
+    let target_elem = document.querySelector('[data-test-id="board-feed"]') ||
+        document.querySelector('[data-test-id="board-section-feed"]') ||
+        document.querySelector('[role="main"]') ||
+        document.body;
     let observer_options = { childList: true, subtree: true };
     select_all_visible_pins();
     observer_running = true;
@@ -524,6 +768,7 @@ function startTimeoutWatcher() {
         }
 
         const time_passed = Date.now() - last_pin_received_time;
+        // INCREASED TIMEOUT for large boards
         if (time_passed > last_pin_received_cut_off_duration_ms) {
             logger('WARN', `Search stopped: No new pins were found in the last ${Math.round(last_pin_received_cut_off_duration_ms / 1000)} seconds.`);
             clearInterval(timeout_watcher_interval);
@@ -533,8 +778,16 @@ function startTimeoutWatcher() {
             observer_running = false;
             DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_warning';
             update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, `Pin search stopped. Proceeding to download ${selected_pins.size} found pins.`);
-            await initialize_downloads();
-        } else if (time_passed > 5000) {
+
+            // If in normal board mode, start download
+            if (!endless_mode_active) {
+                await initialize_downloads();
+            }
+        } else if (time_passed > 10000) {
+            // Aggressive scroll check: if stuck for 10s, try random jumps
+            window.scrollBy(0, -500);
+            setTimeout(() => window.scrollBy(0, 1000), 200);
+
             const time_remaining = Math.max(0, last_pin_received_cut_off_duration_ms - time_passed);
             const seconds_remaining = Math.ceil(time_remaining / 1000);
             DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log cc_countdown';
@@ -553,12 +806,15 @@ function start_auto_scrolling(delay = 1000, human_behavior = true) {
             return;
         }
 
-        const isAtBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 100;
+        const isAtBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 200;
 
         if (!isAtBottom) {
             const px = window.innerHeight * 0.75;
             let altered_px = human_behavior ? px + (Math.random() * px * 0.2) : px;
             window.scrollTo({ top: window.scrollY + altered_px, behavior: 'smooth' });
+        } else {
+            // If at bottom but waiting for pins, wiggle up slightly to trigger loaders
+            window.scrollBy(0, -100);
         }
     }, delay);
 }
@@ -715,7 +971,8 @@ async function initialize_downloads() {
         DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_error';
         update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.download_error);
     } finally {
-        remark_selected_pins();
+        // Only try to remark pins that exist on the current page
+        mark_visible_pins_only();
     }
 }
 
@@ -780,7 +1037,9 @@ function get_pin_element_by_url(url) {
     if (element) return element;
 
     if (window.location.href.includes(url)) {
-        return document.querySelector('[data-grid-item="true"]');
+        return document.querySelector('[data-test-id="closeup-visual-container"]') ||
+            document.querySelector('[data-test-id="visual-content-container"]') ||
+            document.querySelector('[data-grid-item="true"]');
     }
     return null;
 }
@@ -832,6 +1091,11 @@ async function select_pins(pin_urls, reselect = false, subtle = true) {
         let image_url = img_srcset ? parse_srcset(img_srcset, true) : '';
         let has_video = !!pin_element.querySelector('video');
 
+        if (image_url) {
+            // Replaces /736x/, /564x/, /474x/ etc. with /originals/
+            image_url = image_url.replace(/\/[\d]+x\//, '/originals/');
+        }
+
         if (!image_url && !has_video) {
             logger('WARN', `Could not find any image or video for pin: ${url}`);
             continue;
@@ -843,8 +1107,10 @@ async function select_pins(pin_urls, reselect = false, subtle = true) {
 
     if (selection_changed) {
         update_currently_selected_pins();
-        DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
-        update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.selection_success);
+        if (!endless_mode_active) {
+            DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
+            update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.selection_success);
+        }
     }
 }
 
@@ -884,8 +1150,10 @@ function unselect_pins(pin_urls, random = true) {
 
     if (removal_count > 0) update_currently_selected_pins();
 
-    DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
-    update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.clear);
+    if (!endless_mode_active) {
+        DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
+        update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.clear);
+    }
 }
 
 function clean_pin_urls(urls) {
@@ -926,12 +1194,15 @@ async function download_pins(items) {
     }
 
     for (let i = 0; i < chunks.length; i++) {
-        if (cancel_downloads) {
+        if (cancel_downloads && !endless_mode_active) {
             logger('WARN', 'Download process was cancelled by the user.');
             break;
         }
 
         const chunk = chunks[i];
+        // Add a small delay between chunks to let the browser breathe (fixes large board freeze)
+        if (i > 0) await new Promise(r => setTimeout(r, 200));
+
         const promises = chunk.map(async (item) => {
             try {
                 if (item.media_url.includes('.m3u8')) {
@@ -965,20 +1236,178 @@ async function download_pins(items) {
         failed_downloads += results.filter(r => !r).length;
 
         const progress_percentage = Math.min(100, (((i + 1) * MAX_CONCURRENT_DOWNLOADS / items.length) * 100));
-        DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
-        update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, `${message_template.download_progress}: ${progress_percentage.toFixed(0)}%`);
+
+        // Only show percentage log if NOT in endless mode (endless mode has its own status)
+        if (!endless_mode_active) {
+            DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
+            update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, `${message_template.download_progress}: ${progress_percentage.toFixed(0)}%`);
+        }
     }
 
-    if (failed_downloads > 0) {
+    if (failed_downloads > 0 && !endless_mode_active) {
         throw new Error(`${failed_downloads} out of ${items.length} downloads failed. Check the console for details.`);
     }
     return { failed_downloads, successful_downloads };
 }
 
+
+
+function check_if_board_page() {
+    const url = window.location.href;
+    // Board pages have this pattern: /username/board-name/ or /username/board-name/section-name/
+    const is_board = url.match(/pinterest\.com\/[^\/]+\/[^\/]+\/?(?:[^\/]+\/?)?$/) &&
+        !url.includes('/pin/') &&
+        !url.includes('/search/') &&
+        !url.includes('/ideas/') &&
+        url !== 'https://www.pinterest.com/' &&
+        url !== 'https://za.pinterest.com/' &&
+        url !== 'https://pinterest.com/';
+    return !!is_board;
+}
+
+// Detects URL changes and refreshes UI
+function setup_url_change_detection() {
+    current_board_url = window.location.href;
+    is_on_board_page = check_if_board_page();
+
+    // Method 1: Monitor URL changes via history API
+    const original_pushState = history.pushState;
+    const original_replaceState = history.replaceState;
+
+    history.pushState = function (...args) {
+        original_pushState.apply(this, args);
+        handle_url_change();
+    };
+
+    history.replaceState = function (...args) {
+        original_replaceState.apply(this, args);
+        handle_url_change();
+    };
+
+    window.addEventListener('popstate', handle_url_change);
+
+    // Method 2: Fallback polling for URL changes (catches edge cases)
+    setInterval(() => {
+        if (window.location.href !== current_board_url) {
+            handle_url_change();
+        }
+    }, 1000);
+
+    logger('INFO', 'URL change detection is now active.');
+}
+
+// Handles navigation between any pages
+function handle_url_change() {
+    const new_url = window.location.href;
+    if (new_url === current_board_url) return;
+
+    logger('INFO', `Detected navigation from ${current_board_url} to ${new_url}`);
+    current_board_url = new_url;
+
+    // Stop endless mode on navigation
+    if (endless_mode_active) stop_endless_mode();
+
+    const now_on_board = check_if_board_page();
+    const was_on_board = is_on_board_page;
+    is_on_board_page = now_on_board;
+
+    // If UI is open, handle the transition
+    if (DOM.full_ui_wrapper.self && document.body.contains(DOM.full_ui_wrapper.self)) {
+        if (now_on_board) {
+            logger('INFO', 'Navigated to a board/section. Refreshing UI...');
+            refresh_ui_for_new_board();
+        } else {
+            logger('INFO', 'Navigated away from board page. Disabling board-specific features...');
+            disable_board_features();
+        }
+    }
+
+    // Update button visibility based on page type
+    if (DOM.downloader_button.self) {
+        if (now_on_board) {
+            DOM.downloader_button.self.classList.remove('cc_hidden');
+        } else {
+            // Keep button visible but you could hide it if you want
+            // DOM.downloader_button.self.classList.add('cc_hidden');
+        }
+    }
+}
+
+function disable_board_features() {
+    // Stop any ongoing operations
+    cancel_downloads = true;
+    clearInterval(timeout_watcher_interval);
+    clearInterval(auto_scroll_interval);
+    observer?.disconnect();
+    observer = null;
+    observer_running = false;
+
+    // Clear visual overlays
+    document.querySelectorAll('[data-selected-overlay]').forEach(e => e.remove());
+
+    // Update UI to show we're not on a board
+    if (DOM.full_ui_wrapper.board_count_wrapper.current_board_count_elem.self) {
+        DOM.full_ui_wrapper.board_count_wrapper.current_board_count_elem.self.innerHTML = 'N/A';
+    }
+
+    // Reset progress log to clear state (no warning needed)
+    DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
+    update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.clear);
+
+    logger('INFO', 'Board features disabled - not on a board page.');
+}
+
+function refresh_ui_for_new_board() {
+    // Stop any ongoing operations
+    cancel_downloads = true;
+    clearInterval(timeout_watcher_interval);
+    clearInterval(auto_scroll_interval);
+    observer?.disconnect();
+    observer = null;
+    observer_running = false;
+
+    // Clear visual overlays from previous board
+    document.querySelectorAll('[data-selected-overlay]').forEach(e => e.remove());
+
+    // Clear selections if stateful mode is off
+    if (!stateful_mode) {
+        selected_pins.clear();
+        update_currently_selected_pins();
+    } else {
+        // Re-mark pins that are visible on this page
+        mark_visible_pins_only();
+    }
+
+    // Wait a bit for page to load, then update pin count
+    setTimeout(() => {
+        let pin_count = get_board_pin_count();
+
+        if (pin_count?.pin_count >= 0) {
+            update_element_html(DOM.full_ui_wrapper.board_count_wrapper.current_board_count_elem.self, pin_count.formatted_pin_count);
+            logger('INFO', `Detected ${pin_count.pin_count} total pins on this board/section.`);
+        } else {
+            DOM.full_ui_wrapper.board_count_wrapper.current_board_count_elem.self.innerHTML = 'N/A';
+            logger('WARN', 'Could not find the total pin count for this board/section.');
+        }
+
+        // Reset progress log
+        DOM.full_ui_wrapper.progress_log_elem.self.className = 'cc_log';
+        update_element_html(DOM.full_ui_wrapper.progress_log_elem.self, message_template.clear);
+
+        logger('INFO', 'UI refreshed for new board/section.');
+    }, 500);
+}
+
+// UPDATED: get_board_pin_count() - Now supports board sections
 function get_board_pin_count() {
-    logger('DEBUG', 'Attempting to find the total pin count for this board...');
+    logger('DEBUG', 'Attempting to find the total pin count for this board/section...');
     const pinCountRegex = /[\d,]+\s*pin/i;
-    let pin_count_element = document.querySelector('[data-test-id="pin-count"]');
+
+    // Try multiple selectors for different board types
+    let pin_count_element = document.querySelector('[data-test-id="pin-count"]') ||
+        document.querySelector('[data-test-id="board-section-pin-count"]') ||
+        document.querySelector('[data-test-id="board-header-stats"]');
+
     let pin_count_text = pin_count_element?.innerText || document.body.innerText.match(pinCountRegex)?.[0];
     if (!pin_count_text) return null;
 
@@ -1012,12 +1441,13 @@ function update_element_html(element, value = '') {
 function close_full_ui() {
     logger('INFO', 'Closing the downloader UI...');
     cancel_downloads = true;
+    endless_mode_active = false;
     document.body.style.userSelect = '';
 
     document.removeEventListener('contextmenu', handle_click);
-    document.removeEventListener('scroll', remark_selected_pins);
-    document.removeEventListener('drop', remark_selected_pins);
-    window.removeEventListener('resize', remark_selected_pins);
+    document.removeEventListener('scroll', mark_visible_pins_only);
+    document.removeEventListener('drop', mark_visible_pins_only);
+    window.removeEventListener('resize', mark_visible_pins_only);
 
     clearInterval(timeout_watcher_interval);
     clearInterval(auto_scroll_interval);
