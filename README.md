@@ -18,6 +18,7 @@ This extension simplifies downloading images from Pinterest with powerful, user-
 *   **Minimized View**: A more compact interface option.
 *   **Improved Memory Management**: Prevents slowdowns during long downloads by clearing old pins.
 *   **Image Downloads Only**: Focuses solely on downloading images for a fast and efficient solution.
+*   **Endless Mode**: Endless Mode makes the Pinterest Board Downloader fully automatic: it endlessly scrolls, loads, selects, and downloads pins in batches forever—no manual clicks needed. Ideal for massive or growing boards. Stop anytime with one click.
 
 ## How to Install (Chrome & Edge)
 
